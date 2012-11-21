@@ -21,11 +21,12 @@
 #include <CL/cl.h>
 #include <glib.h>
 #include <stdio.h>
+#include <math.h>
 
 #include "ocl.h"
 
 typedef struct {
-    gint num_images;
+    guint batch_size;
     guint num_runs;
     guint width;
     guint height;
@@ -33,7 +34,6 @@ typedef struct {
 
 typedef struct {
     Settings    *settings;
-    guint        num_images;
     gsize        image_size;
     cl_kernel   *kernels;
     opencl_desc *ocl;
@@ -41,15 +41,31 @@ typedef struct {
 
 typedef void (*BenchmarkFunc) (Benchmark *benchmark, cl_mem_flags flags);
 
-static void
-generate_2d_data (gfloat *buffer,
-                  guint start,
-                  guint width,
-                  guint height)
-{
-    for (guint i = start; i < start + width*height; i++)
-        buffer[i] = (gfloat) i;
-}
+/* static void */
+/* generate_2d_data (gfloat *buffer, */
+/*                   guint start, */
+/*                   guint width, */
+/*                   guint height) */
+/* { */
+/*     for (guint i = start; i < start + width*height; i++) { */
+/*         buffer[i] = (gfloat) (i + 1 - start); */
+/*     } */
+/* } */
+
+/* static gfloat */
+/* compare_2d_data (gfloat *buffer, */
+/*                  guint start, */
+/*                  guint width, */
+/*                  guint height) */
+/* { */
+/*     gfloat result = 0.0f; */
+
+/*     for (guint i = start; i < start + width*height; i++) { */
+/*         result += abs (-log((gfloat) (i + 1 - start)) - buffer[i]); */
+/*     } */
+    
+/*     return result; */
+/* } */
 
 static Benchmark *
 setup_benchmark(opencl_desc *ocl, Settings *settings)
@@ -78,10 +94,7 @@ setup_benchmark(opencl_desc *ocl, Settings *settings)
         CHECK_ERROR(errcode);
     }
 
-    b->num_images = b->settings->num_images < 0 ? ocl->num_devices * 16 : b->settings->num_images;
     b->image_size = b->settings->width * b->settings->height * sizeof(gfloat);
-
-    g_print("# Computing <nlm> for %i images of size %ix%i\n", b->num_images, b->settings->width, b->settings->height);
 
     return b;
 }
@@ -92,8 +105,8 @@ teardown_benchmark (Benchmark *b)
     g_free (b);
 }
 
-static void
-measure_benchmark (const gchar *prefix, BenchmarkFunc func, Benchmark *benchmark, cl_mem_flags flags)
+static gdouble
+measure_benchmark (BenchmarkFunc func, Benchmark *benchmark, cl_mem_flags flags)
 {
     gdouble time;
     GTimer *timer;
@@ -103,87 +116,134 @@ measure_benchmark (const gchar *prefix, BenchmarkFunc func, Benchmark *benchmark
     g_timer_stop (timer);
     time = g_timer_elapsed (timer, NULL);
     g_timer_destroy(timer);
-
-    g_print("# %s: total = %fs\n", prefix, time);
+    return time;
 }
 
 static void
 execute_single_buffer (Benchmark *b, cl_mem_flags flags)
 {
-    gfloat  *host_mem;
-    cl_mem   dev_mem;
+    gfloat  *host_in_mem;
+    gfloat  *host_out_mem;
+    cl_mem   dev_in_mem;
+    cl_mem   dev_out_mem;
     cl_int   err;
     cl_event event;
 
     size_t global_work_size[] = { b->settings->width, b->settings->height };
 
-    host_mem = g_malloc0 (b->image_size);
-    dev_mem = clCreateBuffer (b->ocl->context,
-                              flags | CL_MEM_READ_WRITE,
-                              b->image_size,
-                              host_mem,
-                              &err);
+    host_in_mem = g_malloc0 (b->image_size);
+    host_out_mem = g_malloc0 (b->image_size);
+    
+    dev_in_mem = clCreateBuffer (b->ocl->context,
+                                 flags | CL_MEM_READ_ONLY,
+                                 b->image_size,
+                                 host_in_mem,
+                                 &err);
+    CHECK_ERROR (err);
+
+    dev_out_mem = clCreateBuffer (b->ocl->context,
+                                  CL_MEM_WRITE_ONLY,
+                                  b->image_size,
+                                  NULL,
+                                  &err);
+    CHECK_ERROR (err);
+
+    CHECK_ERROR (clSetKernelArg (b->kernels[0], 0, sizeof (cl_mem), (gpointer) &dev_in_mem));
+    CHECK_ERROR (clSetKernelArg (b->kernels[0], 1, sizeof (cl_mem), (gpointer) &dev_out_mem));
 
     for (guint i = 0; i < b->settings->num_runs; i++) {
-        generate_2d_data (host_mem, 0, b->settings->width, b->settings->height);
+        /* gfloat compute_error; */
+
+        /* generate_2d_data (host_in_mem, 0, b->settings->width, b->settings->height); */
 
         if (!(flags & CL_MEM_USE_HOST_PTR)) {
-            clEnqueueWriteBuffer (b->ocl->cmd_queues[0],
-                                  dev_mem, CL_TRUE,
-                                  0, b->image_size,
-                                  host_mem,
-                                  0, NULL, NULL);
+            err = clEnqueueWriteBuffer (b->ocl->cmd_queues[0],
+                                        dev_in_mem, CL_TRUE,
+                                        0, b->image_size,
+                                        host_in_mem,
+                                        0, NULL, NULL);
+            CHECK_ERROR (err);
         }
 
-        clEnqueueNDRangeKernel (b->ocl->cmd_queues[0],
-                                b->kernels[0],
-                                2, NULL, global_work_size, NULL,
-                                0, NULL, &event);
+        err = clEnqueueNDRangeKernel (b->ocl->cmd_queues[0],
+                                      b->kernels[0],
+                                      2, NULL, global_work_size, NULL,
+                                      0, NULL, &event);
+
+        CHECK_ERROR (err);
         clWaitForEvents (1, &event);
         clReleaseEvent (event);
+
+        err = clEnqueueReadBuffer (b->ocl->cmd_queues[0],
+                                   dev_out_mem, CL_TRUE,
+                                   0, b->image_size,
+                                   host_out_mem,
+                                   0, NULL, NULL);
+        CHECK_ERROR (err);
+        /* compute_error = compare_2d_data (host_out_mem, 0, */
+        /*                                  b->settings->width, */
+        /*                                  b->settings->height); */
+
+/*         if (compute_error > 0.001) */
+/*             g_warning ("Error is %f\n", compute_error); */
     }
 
-    clReleaseMemObject (dev_mem);
-    g_free (host_mem);
+    clReleaseMemObject (dev_in_mem);
+    clReleaseMemObject (dev_out_mem);
+    g_free (host_in_mem);
+    g_free (host_out_mem);
 }
 
 static void
 execute_batched_buffer (Benchmark *b, cl_mem_flags flags)
 {
-    gfloat  *host_mem;
-    cl_mem   dev_mem;
+    gfloat  *host_in_mem;
+    gfloat  *host_out_mem;
+    cl_mem   dev_in_mem;
+    cl_mem   dev_out_mem;
     cl_int   err;
     cl_event event;
     guint    batch_size;
     gsize    buffer_size;
     size_t   global_work_size[2];
 
-    batch_size = 8;
+    batch_size = 2;
     buffer_size = b->image_size * batch_size;
 
-    host_mem = g_malloc0 (buffer_size);
-    dev_mem = clCreateBuffer (b->ocl->context,
-                              flags | CL_MEM_READ_WRITE,
-                              buffer_size,
-                              host_mem,
-                              &err);
+    host_in_mem = g_malloc0 (buffer_size);
+    host_out_mem = g_malloc0 (buffer_size);
+
+    dev_in_mem = clCreateBuffer (b->ocl->context,
+                                 flags | CL_MEM_READ_ONLY,
+                                 buffer_size,
+                                 host_in_mem,
+                                 &err);
+
+    dev_out_mem = clCreateBuffer (b->ocl->context,
+                                  CL_MEM_WRITE_ONLY,
+                                  buffer_size,
+                                  NULL,
+                                  &err);
+
+    clSetKernelArg (b->kernels[0], 0, sizeof (cl_mem), (gpointer) &dev_in_mem);
+    clSetKernelArg (b->kernels[0], 1, sizeof (cl_mem), (gpointer) &dev_out_mem);
 
     global_work_size[0] = b->settings->width;
     global_work_size[1] = batch_size * b->settings->height;
 
     for (guint i = 0; i < b->settings->num_runs / batch_size; i++) {
-        for (guint j = 0; j < batch_size; j++) {
-            generate_2d_data (host_mem,
-                              j * b->settings->width * b->settings->height,
-                              b->settings->width,
-                              b->settings->height);
-        }
+        /* for (guint j = 0; j < batch_size; j++) { */
+        /*     generate_2d_data (host_in_mem, */
+        /*                       j * b->settings->width * b->settings->height, */
+        /*                       b->settings->width, */
+        /*                       b->settings->height); */
+        /* } */
 
         if (!(flags & CL_MEM_USE_HOST_PTR)) {
             clEnqueueWriteBuffer (b->ocl->cmd_queues[0],
-                                  dev_mem, CL_TRUE,
-                                  0, b->image_size,
-                                  host_mem,
+                                  dev_in_mem, CL_TRUE,
+                                  0, buffer_size,
+                                  host_in_mem,
                                   0, NULL, NULL);
         }
 
@@ -191,28 +251,48 @@ execute_batched_buffer (Benchmark *b, cl_mem_flags flags)
                                 b->kernels[0],
                                 2, NULL, global_work_size, NULL,
                                 0, NULL, &event);
+
         clWaitForEvents (1, &event);
         clReleaseEvent (event);
+
+        err = clEnqueueReadBuffer (b->ocl->cmd_queues[0],
+                                   dev_out_mem, CL_TRUE,
+                                   0, buffer_size,
+                                   host_out_mem,
+                                   0, NULL, NULL);
+
+        /* for (guint j = 0; j < batch_size; j++) { */
+        /*     gfloat compute_error; */
+
+        /*     compute_error = compare_2d_data (host_out_mem, */ 
+        /*                                      j * b->settings->width * b->settings->height, */
+        /*                                      b->settings->width, */
+        /*                                      b->settings->height); */
+
+        /*     if (compute_error > 0.001) */
+        /*         g_print ("Error in batch %i is %f\n", j, compute_error); */
+        /* } */
     }
 
-    clReleaseMemObject (dev_mem);
-    g_free (host_mem);
-    
+    clReleaseMemObject (dev_in_mem);
+    clReleaseMemObject (dev_out_mem);
+    g_free (host_in_mem);
+    g_free (host_out_mem);
 }
 
 int
 main(int argc, char *argv[])
 {
     static Settings settings = {
+        .batch_size = 2,
         .num_runs = 32,
-        .num_images = -1,
         .width = 1024,
         .height = 1024,
     };
 
     static GOptionEntry entries[] = {
-        { "num-images", 'n', 0, G_OPTION_ARG_INT, &settings.num_images, "Number of images", "N" },
-        { "num-runs", 'r', 0, G_OPTION_ARG_INT, &settings.num_runs, "Number of runs", "N" },
+        { "num-runs", 'n', 0, G_OPTION_ARG_INT, &settings.num_runs, "Number of runs", "N" },
+        { "batch-size", 'b', 0, G_OPTION_ARG_INT, &settings.batch_size, "Number of images per batch", "N" },
         { "width", 'w', 0, G_OPTION_ARG_INT, &settings.width, "Width of imags", "W" },
         { "height", 'h', 0, G_OPTION_ARG_INT, &settings.height, "Height of images", "H" },
         { NULL }
@@ -231,17 +311,29 @@ main(int argc, char *argv[])
         return 1;
     }
 
-    g_print("## %s@%s\n", g_get_user_name(), g_get_host_name());
+    if (settings.num_runs % settings.batch_size) {
+        g_print ("Number of runs %i is not a multiple of the batch size %i\n",
+                 settings.num_runs,
+                 settings.batch_size);
+        return 1;
+    }
 
     g_thread_init (NULL);
 
     ocl = ocl_new (FALSE);
     benchmark = setup_benchmark (ocl, &settings);
 
-    measure_benchmark ("Single/Copy", execute_single_buffer, benchmark, 0);
-    measure_benchmark ("Single/Pinned", execute_single_buffer, benchmark, CL_MEM_USE_HOST_PTR);
-    measure_benchmark ("Batched/Copy", execute_batched_buffer, benchmark, 0);
-    measure_benchmark ("Batched/Pinned", execute_batched_buffer, benchmark, CL_MEM_USE_HOST_PTR);
+    g_print ("# [width] [height] [num_runs] [batch_size] [single-copy] [single-pinned] [batch-copy] [batch-pinned]\n");
+    g_print ("%i %i %i %i ",
+             settings.width,
+             settings.height,
+             settings.num_runs,
+             settings.batch_size);
+
+    g_print ("%f ", measure_benchmark (execute_single_buffer, benchmark, 0));
+    g_print ("%f ", measure_benchmark (execute_single_buffer, benchmark, CL_MEM_USE_HOST_PTR));
+    g_print ("%f ", measure_benchmark (execute_batched_buffer, benchmark, 0));
+    g_print ("%f\n", measure_benchmark (execute_batched_buffer, benchmark, CL_MEM_USE_HOST_PTR));
 
     teardown_benchmark (benchmark);
     ocl_free (ocl);
